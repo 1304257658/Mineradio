@@ -1317,6 +1317,78 @@ ipcMain.handle('mineradio-wallpaper-update', async (_event, payload) => {
   }
 });
 
+// ===== go-music-api sidecar（聚合音源后端，独立进程）=====
+// 启动 Mineradio 时自动拉起；已在运行则复用；找不到目录则跳过(网易/QQ 不受影响)。
+let goMusicApiProc = null;
+const GO_MUSIC_API_PORT = Number(process.env.GO_MUSIC_API_PORT || 8080);
+
+function tcpPortInUse(port, host) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; try { socket.destroy(); } catch (e) {} resolve(v); };
+    socket.setTimeout(1200);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    try { socket.connect(port, host || '127.0.0.1'); } catch (e) { finish(false); }
+  });
+}
+
+function resolveGoMusicApiDir() {
+  const candidates = [
+    process.env.GO_MUSIC_API_DIR,
+    path.join(__dirname, '..', 'go-music-api'),
+    process.resourcesPath ? path.join(process.resourcesPath, 'go-music-api') : null,
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      if (fs.existsSync(dir) &&
+          (fs.existsSync(path.join(dir, 'go-music-api.exe')) || fs.existsSync(path.join(dir, 'main.go')))) {
+        return dir;
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+async function startGoMusicApi() {
+  if (process.env.GO_MUSIC_API_DISABLE === '1') { console.log('[go-music-api] 已禁用 (GO_MUSIC_API_DISABLE=1)'); return; }
+  if (await tcpPortInUse(GO_MUSIC_API_PORT)) {
+    console.log('[go-music-api] 端口 ' + GO_MUSIC_API_PORT + ' 已在运行，复用现有进程');
+    return;
+  }
+  const dir = resolveGoMusicApiDir();
+  if (!dir) { console.warn('[go-music-api] 未找到 go-music-api 目录，聚合音源不可用 (网易/QQ 不受影响)'); return; }
+  const exe = path.join(dir, 'go-music-api.exe');
+  let cmd, args;
+  if (fs.existsSync(exe)) { cmd = exe; args = []; }
+  else { cmd = process.platform === 'win32' ? 'go.exe' : 'go'; args = ['run', '.']; }
+  try {
+    goMusicApiProc = spawn(cmd, args, { cwd: dir, env: Object.assign({}, process.env), windowsHide: true });
+    console.log('[go-music-api] 启动:', cmd, args.join(' '), '@', dir);
+    if (goMusicApiProc.stdout) goMusicApiProc.stdout.on('data', (d) => process.stdout.write('[go-music-api] ' + d));
+    if (goMusicApiProc.stderr) goMusicApiProc.stderr.on('data', (d) => process.stderr.write('[go-music-api] ' + d));
+    goMusicApiProc.on('exit', (code) => { console.log('[go-music-api] 退出 code=' + code); goMusicApiProc = null; });
+    goMusicApiProc.on('error', (e) => { console.warn('[go-music-api] 启动失败:', e.message, '(需预编译二进制或已安装 Go)'); goMusicApiProc = null; });
+  } catch (e) {
+    console.warn('[go-music-api] spawn 异常:', e.message);
+  }
+}
+
+function stopGoMusicApi() {
+  if (!goMusicApiProc) return;
+  const pid = goMusicApiProc.pid;
+  try {
+    if (process.platform === 'win32' && pid) {
+      execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {}); // go run 会派生子进程，杀进程树
+    } else {
+      goMusicApiProc.kill();
+    }
+  } catch (e) { console.warn('[go-music-api] 结束进程失败:', e.message); }
+  goMusicApiProc = null;
+}
+
 async function createWindow() {
   htmlFullscreenActive = false;
   windowFullscreenActive = false;
@@ -1439,6 +1511,7 @@ if (!gotSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    startGoMusicApi().catch((e) => console.warn('[go-music-api] 启动流程异常:', e && e.message));
     screen.on('display-metrics-changed', () => {
       positionDesktopLyricsWindow();
       positionWallpaperWindow();
@@ -1461,6 +1534,7 @@ if (!gotSingleInstanceLock) {
   app.on('before-quit', () => {
     unregisterMineradioGlobalHotkeys();
     closeOverlayWindows();
+    stopGoMusicApi();
     if (localServer && localServer.close) localServer.close();
   });
 }

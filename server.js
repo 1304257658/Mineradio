@@ -58,6 +58,14 @@ const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const COOKIE_FILE = process.env.COOKIE_FILE || path.join(__dirname, '.cookie');
+// go-music-api 聚合后端（独立进程 / sidecar，默认本机 8080）。
+// 仅做 HTTP 转发，不链接其代码；soda 源在适配层显式排除。
+const GO_MUSIC_API_BASE = (process.env.GO_MUSIC_API || 'http://127.0.0.1:8080').replace(/\/+$/, '');
+const AGG_EXCLUDED_SOURCES = new Set(['soda']); // 汽水解密流不接入
+// 默认只用国内可达的快源（排除 soda 与 joox/jamendo 等海外源，避免聚合等最慢源超时）
+const AGG_DEFAULT_SOURCES = (process.env.GO_MUSIC_SOURCES || 'netease,qq,kugou,kuwo,migu,qianqian')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const AGG_TIMEOUT_MS = Number(process.env.GO_MUSIC_TIMEOUT || 25000); // 多源聚合放宽超时
 const QQ_COOKIE_FILE = process.env.QQ_COOKIE_FILE || path.join(__dirname, '.qq-cookie');
 const UPDATE_WORK_DIR = process.env.MINERADIO_UPDATE_DIR || path.join(__dirname, 'updates');
 const UPDATE_DOWNLOAD_DIR = process.env.MINERADIO_UPDATE_DOWNLOAD_DIR || path.join(UPDATE_WORK_DIR, 'downloads');
@@ -1779,6 +1787,139 @@ async function requestJson(targetUrl, opts, body) {
   }
 }
 
+// ===== go-music-api 聚合适配层 =====
+// 把 go-music-api 的返回字段对齐成 Mineradio 现有 song 结构。
+// 数组值会展开成重复 query 参数（go-music-api 的 sources 用 c.QueryArray）。
+function aggApiUrl(pathname, params) {
+  const u = new URL(GO_MUSIC_API_BASE + pathname);
+  Object.keys(params || {}).forEach(k => {
+    const v = params[k];
+    if (v === undefined || v === null || v === '') return;
+    if (Array.isArray(v)) v.forEach(item => { if (item) u.searchParams.append(k, String(item)); });
+    else u.searchParams.set(k, String(v));
+  });
+  return u.toString();
+}
+
+// 独立的请求器：超时可配（requestText 写死 10s，多源聚合不够用）。
+function aggRequestJson(targetUrl) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const lib = u.protocol === 'https:' ? https : http;
+    const req = lib.request(u, { method: 'GET', headers: { 'User-Agent': UA, Accept: 'application/json' } }, response => {
+      const chunks = [];
+      response.on('data', c => chunks.push(c));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (response.statusCode >= 400) { const e = new Error('HTTP ' + response.statusCode); e.body = text; reject(e); return; }
+        try { resolve(JSON.parse(text)); } catch (e) { reject(new Error('Invalid JSON from ' + u.pathname)); }
+      });
+    });
+    req.setTimeout(AGG_TIMEOUT_MS, () => req.destroy(new Error('Request timeout (' + AGG_TIMEOUT_MS + 'ms) → go-music-api')));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// 解析 sources：接受数组 / 逗号串；为空用默认；始终剔除被排除源(soda)。
+function aggResolveSources(sources) {
+  let list = [];
+  if (Array.isArray(sources)) list = sources;
+  else if (typeof sources === 'string' && sources.trim()) list = sources.split(',');
+  list = list.map(s => String(s).trim()).filter(Boolean);
+  if (!list.length) list = AGG_DEFAULT_SOURCES;
+  return list.filter(s => !AGG_EXCLUDED_SOURCES.has(s));
+}
+
+function aggMapSong(item) {
+  item = item || {};
+  const durRaw = Number(item.duration) || 0;
+  const duration = durRaw > 100000 ? durRaw : durRaw * 1000; // 统一成毫秒
+  const extra = item.extra && typeof item.extra === 'object' ? item.extra : null;
+  const artist = item.artist || '';
+  return {
+    provider: 'agg',
+    source: item.source || '',     // 子平台：netease/qq/kuwo/kugou...
+    type: 'agg',
+    id: String(item.id || ''),
+    name: item.name || '',
+    artist,
+    artists: artist ? [{ name: artist }] : [],
+    album: item.album || '',
+    cover: item.cover || '',
+    duration,
+    extra,
+    extraStr: extra ? JSON.stringify(extra) : '',
+    fee: 0,
+    playable: false,
+  };
+}
+
+async function aggSearch(keywords, sources, limit) {
+  const params = { q: keywords, type: 'song', sources: aggResolveSources(sources) };
+  const json = await aggRequestJson(aggApiUrl('/api/v1/music/search', params));
+  let songs = (json && json.data && json.data.songs) || [];
+  songs = songs
+    .map(aggMapSong)
+    .filter(s => s.id && s.name && !AGG_EXCLUDED_SOURCES.has(s.source));
+  // 按来源轮转交错，避免某些源被 limit 截断后完全消失（多源公平展示）
+  const groups = {};
+  for (const s of songs) (groups[s.source] = groups[s.source] || []).push(s);
+  const order = Object.keys(groups);
+  if (order.length > 1) {
+    const interleaved = [];
+    for (let i = 0; interleaved.length < songs.length; i++) {
+      let any = false;
+      for (const k of order) { if (groups[k][i]) { interleaved.push(groups[k][i]); any = true; } }
+      if (!any) break;
+    }
+    songs = interleaved;
+  }
+  if (limit) songs = songs.slice(0, limit);
+  return songs;
+}
+
+// 取流：返回 go-music-api 的 /stream 直链（含防盗链/解密），由前端 /api/audio 代理播放。
+async function aggSongUrl(song, quality) {
+  song = song || {};
+  const source = String(song.source || '');
+  if (!source || AGG_EXCLUDED_SOURCES.has(source))
+    return { provider: 'agg', url: '', playable: false, error: 'UNSUPPORTED_SOURCE' };
+  const common = {
+    source,
+    id: song.id,
+    name: song.name,
+    artist: song.artist,
+    album: song.album,
+    duration: song.duration ? Math.round(Number(song.duration) / 1000) : undefined,
+    extra: song.extraStr || (song.extra ? JSON.stringify(song.extra) : undefined),
+    quality: quality || undefined,
+  };
+  // 先验证可解析（拿到裸直链），再交给 /stream 播放
+  let rawUrl = '';
+  try {
+    const json = await aggRequestJson(aggApiUrl('/api/v1/music/url', common));
+    rawUrl = (json && json.data && json.data.url) || '';
+  } catch (e) { /* 落到 stream 兜底 */ }
+  const streamUrl = aggApiUrl('/api/v1/music/stream', common);
+  return {
+    provider: 'agg',
+    source,
+    url: streamUrl,
+    rawUrl,
+    playable: !!rawUrl || true, // stream 兜底，最终以播放器为准
+  };
+}
+
+async function aggLyric(song) {
+  song = song || {};
+  const json = await aggRequestJson(aggApiUrl('/api/v1/music/lyric', {
+    source: song.source, id: song.id,
+    extra: song.extraStr || (song.extra ? JSON.stringify(song.extra) : undefined),
+  }));
+  return { provider: 'agg', source: song.source, lyric: (json && json.data && json.data.lyric) || '' };
+}
+
 function clampNumber(value, min, max, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
   const n = Number(value);
@@ -3436,6 +3577,60 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ===== 聚合源（go-music-api 转发）=====
+  if (pn === '/api/agg/search') {
+    try {
+      const kw = url.searchParams.get('keywords') || url.searchParams.get('q') || '';
+      const limit = Math.max(1, Math.min(50, parseInt(url.searchParams.get('limit') || '20', 10) || 20));
+      const sourcesArr = url.searchParams.getAll('sources'); // 支持 ?sources=a&sources=b
+      const srcParam = sourcesArr.length ? sourcesArr : (url.searchParams.get('sources') || url.searchParams.get('source') || '');
+      const songs = await aggSearch(kw, srcParam, limit);
+      sendJSON(res, { provider: 'agg', songs });
+    } catch (err) {
+      console.error('[AggSearch]', err.message);
+      sendJSON(res, { provider: 'agg', error: err.message, songs: [], hint: 'go-music-api 未启动或不可达？默认 ' + GO_MUSIC_API_BASE }, 502);
+    }
+    return;
+  }
+
+  if (pn === '/api/agg/song/url') {
+    try {
+      const song = {
+        source: url.searchParams.get('source') || '',
+        id: url.searchParams.get('id') || '',
+        name: url.searchParams.get('name') || '',
+        artist: url.searchParams.get('artist') || '',
+        album: url.searchParams.get('album') || '',
+        duration: Number(url.searchParams.get('duration') || 0),
+        extraStr: url.searchParams.get('extra') || '',
+      };
+      const quality = url.searchParams.get('quality') || '';
+      const info = await aggSongUrl(song, quality);
+      sendJSON(res, info);
+    } catch (err) {
+      console.error('[AggSongUrl]', err.message);
+      sendJSON(res, { provider: 'agg', url: '', playable: false, error: err.message }, 502);
+    }
+    return;
+  }
+
+  if (pn === '/api/agg/lyric') {
+    try {
+      const song = {
+        source: url.searchParams.get('source') || '',
+        id: url.searchParams.get('id') || '',
+        extraStr: url.searchParams.get('extra') || '',
+      };
+      if (!song.source || !song.id) { sendJSON(res, { provider: 'agg', error: 'Missing source or id', lyric: '' }, 400); return; }
+      const data = await aggLyric(song);
+      sendJSON(res, data);
+    } catch (err) {
+      console.error('[AggLyric]', err.message);
+      sendJSON(res, { provider: 'agg', error: err.message, lyric: '' }, 502);
+    }
+    return;
+  }
+
   if (pn === '/api/qq/song/url') {
     try {
       const mid = url.searchParams.get('mid') || url.searchParams.get('id') || '';
@@ -4201,3 +4396,4 @@ server.listen(PORT, HOST, () => {
 });
 
 module.exports = server;
+// agg-adapter loaded

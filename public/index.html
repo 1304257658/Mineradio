@@ -196,6 +196,18 @@ body.empty-home-active.diy-mode #search-area:not(.has-results) #search-mode-tabs
 .tag-source{display:inline-flex;align-items:center;height:16px;padding:0 6px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.045);font-size:8.5px;font-weight:800;letter-spacing:.55px;line-height:1;flex-shrink:0}
 .tag-source.netease{color:#ffd8dd;border-color:rgba(217,91,103,.30);background:rgba(217,91,103,.075)}
 .tag-source.qq{color:#f0ffc8;border-color:rgba(191,214,107,.30);background:rgba(191,214,107,.075)}
+.tag-source.agg{color:#cdeee6;border-color:rgba(90,200,170,.30);background:rgba(90,200,170,.08)}
+.tag-source.agg-netease{color:#ffd8dd;border-color:rgba(217,91,103,.32);background:rgba(217,91,103,.085)}
+.tag-source.agg-qq{color:#f0ffc8;border-color:rgba(191,214,107,.32);background:rgba(191,214,107,.085)}
+.tag-source.agg-kugou{color:#cfe1ff;border-color:rgba(90,140,230,.34);background:rgba(90,140,230,.095)}
+.tag-source.agg-kuwo{color:#ffe6b8;border-color:rgba(230,168,60,.34);background:rgba(230,168,60,.095)}
+.tag-source.agg-migu{color:#ffd6e3;border-color:rgba(232,80,130,.34);background:rgba(232,80,130,.095)}
+.tag-source.agg-qianqian{color:#e4d6ff;border-color:rgba(150,100,230,.34);background:rgba(150,100,230,.095)}
+.tag-source.agg-bilibili{color:#d6f0ff;border-color:rgba(80,170,230,.34);background:rgba(80,170,230,.095)}
+.agg-source-bar{display:flex;flex-wrap:wrap;gap:6px;padding:7px 2px 3px}
+.agg-src-chip{height:22px;padding:0 9px;border-radius:999px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.035);color:rgba(255,255,255,.42);font-size:11px;font-weight:700;letter-spacing:.3px;cursor:pointer;transition:color .15s,background .15s,border-color .15s}
+.agg-src-chip:hover{color:rgba(255,255,255,.78);border-color:rgba(255,255,255,.2)}
+.agg-src-chip.on{color:#fff;background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.26)}
 .search-result.qq-source:hover{background:rgba(191,214,107,.052)}
 .search-result.netease-source:hover{background:rgba(217,91,103,.045)}
 .podcast-result-head{display:flex;align-items:center;gap:10px;padding:11px 13px 9px;border-bottom:1px solid rgba(255,255,255,.04);background:rgba(255,255,255,.025)}
@@ -1910,8 +1922,10 @@ html.control-glass-svg-ok #visual-guide-btn:hover{
       <button id="search-mode-song" class="active" type="button" onclick="setSearchMode('song')" aria-selected="true">All</button>
       <button id="search-mode-netease" type="button" onclick="setSearchMode('netease')" aria-selected="false">NE</button>
       <button id="search-mode-qq" type="button" onclick="setSearchMode('qq')" aria-selected="false">QQ</button>
+      <button id="search-mode-agg" type="button" onclick="setSearchMode('agg')" aria-selected="false">多源</button>
       <button id="search-mode-podcast" type="button" onclick="setSearchMode('podcast')" aria-selected="false">Podcast</button>
     </div>
+    <div id="agg-source-bar" class="agg-source-bar" style="display:none"></div>
     <div id="search-results"></div>
   </div>
   <div id="upload-actions">
@@ -10313,7 +10327,9 @@ async function fetchBeatPrefetchAudioUrl(song) {
   if (!isQQ && requestedQuality === 'jymaster' && !hasProviderSvip('netease', loginStatus)) requestedQuality = 'hires';
   if (isQQ && qqPlaybackQualityCeiling && (requestedQuality === 'jymaster' || requestedQuality === 'hires' || requestedQuality === 'lossless')) requestedQuality = qqPlaybackQualityCeiling;
   var qualityParam = '&quality=' + encodeURIComponent(requestedQuality);
-  var data = isQQ
+  var data = songProviderKey(song) === 'agg'
+    ? await apiJson('/api/agg/song/url?' + aggSongQuery(song) + qualityParam)
+    : isQQ
     ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
     : await apiJson('/api/song/url?id=' + encodeURIComponent(song.id) + qualityParam);
   if (!data || !data.url || data.trial) return null;
@@ -17267,6 +17283,7 @@ function updateSearchModeTabs() {
   var songBtn = document.getElementById('search-mode-song');
   var neteaseBtn = document.getElementById('search-mode-netease');
   var qqBtn = document.getElementById('search-mode-qq');
+  var aggBtn = document.getElementById('search-mode-agg');
   var podcastBtn = document.getElementById('search-mode-podcast');
   if (songBtn) {
     songBtn.classList.toggle('active', searchMode === 'song');
@@ -17280,6 +17297,10 @@ function updateSearchModeTabs() {
     qqBtn.classList.toggle('active', searchMode === 'qq');
     qqBtn.setAttribute('aria-selected', searchMode === 'qq' ? 'true' : 'false');
   }
+  if (aggBtn) {
+    aggBtn.classList.toggle('active', searchMode === 'agg');
+    aggBtn.setAttribute('aria-selected', searchMode === 'agg' ? 'true' : 'false');
+  }
   if (podcastBtn) {
     podcastBtn.classList.toggle('active', searchMode === 'podcast');
     podcastBtn.setAttribute('aria-selected', searchMode === 'podcast' ? 'true' : 'false');
@@ -17287,12 +17308,13 @@ function updateSearchModeTabs() {
   if ($input) {
     $input.placeholder = searchMode === 'podcast'
       ? '搜索播客、电台...'
-      : (searchMode === 'qq' ? '搜索 QQ 音乐...' : (searchMode === 'netease' ? '搜索网易云音乐...' : '搜索歌曲、歌手...'));
+      : (searchMode === 'agg' ? '多源搜索(酷狗/酷我/咪咕/QQ/网易...)' : (searchMode === 'qq' ? '搜索 QQ 音乐...' : (searchMode === 'netease' ? '搜索网易云音乐...' : '搜索歌曲、歌手...')));
   }
+  renderAggSourceBar();
   requestAnimationFrame(updateSearchPillGlassDisplacementMap);
 }
 function setSearchMode(mode) {
-  mode = (mode === 'podcast' || mode === 'netease' || mode === 'qq') ? mode : 'song';
+  mode = (mode === 'podcast' || mode === 'netease' || mode === 'qq' || mode === 'agg') ? mode : 'song';
   if (searchMode === mode) return;
   searchMode = mode;
   updateSearchModeTabs();
@@ -17506,13 +17528,89 @@ document.addEventListener('click', function(e){
 updateSearchModeTabs();
 
 function songProviderKey(song) {
+  // 聚合源(go-music-api)优先判定：其 source 可能是 qq/netease 等子平台，必须先认 provider/type=agg
+  if (song && (song.provider === 'agg' || song.type === 'agg')) return 'agg';
   if (song && (song.provider === 'qq' || song.source === 'qq' || song.type === 'qq')) return 'qq';
   return 'netease';
 }
+// 聚合源子平台中文名
+var AGG_SUB_LABELS = { netease: '网易', qq: 'QQ', kugou: '酷狗', kuwo: '酷我', migu: '咪咕', qianqian: '千千', bilibili: 'B站', joox: 'JOOX', jamendo: 'Jamendo', fivesing: '5sing' };
 function songSourceTagHtml(song) {
   var key = songProviderKey(song);
+  if (key === 'agg') {
+    var sub = AGG_SUB_LABELS[song.source] || (song.source || '').toUpperCase() || '多源';
+    return '<span class="tag-source agg agg-' + escHtml(song.source || 'x') + '">' + escHtml(sub) + '</span>';
+  }
   var label = key === 'qq' ? 'QQ' : 'NE';
   return '<span class="tag-source ' + key + '">' + label + '</span>';
+}
+// 构造聚合源取流/歌词的 query（携带 go-music-api 需要的字段，尤其 extra）
+function aggSongQuery(song) {
+  song = song || {};
+  return 'source=' + encodeURIComponent(song.source || '') +
+    '&id=' + encodeURIComponent(song.id || '') +
+    '&name=' + encodeURIComponent(song.name || '') +
+    '&artist=' + encodeURIComponent(song.artist || '') +
+    '&album=' + encodeURIComponent(song.album || '') +
+    '&duration=' + (Number(song.duration) || 0) +
+    '&extra=' + encodeURIComponent(song.extraStr || '');
+}
+// 聚合源：全部可选平台（保留海外源；soda 不接入）
+var AGG_ALL_SOURCES = ['netease','qq','kugou','kuwo','migu','qianqian','bilibili','joox','jamendo','fivesing'];
+// 默认只选大陆快源（≤6，正好不撞浏览器并发上限）；海外源可在切换条手动开启
+var AGG_DEFAULT_SELECTED = ['netease','qq','kugou','kuwo','migu','qianqian'];
+var aggSelectedSources = AGG_DEFAULT_SELECTED.slice();
+function renderAggSourceBar() {
+  var bar = document.getElementById('agg-source-bar');
+  if (!bar) return;
+  if (searchMode !== 'agg') { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  bar.innerHTML = AGG_ALL_SOURCES.map(function(src){
+    var on = aggSelectedSources.indexOf(src) >= 0;
+    var label = AGG_SUB_LABELS[src] || src;
+    return '<button type="button" class="agg-src-chip agg-' + src + (on ? ' on' : '') + '" onclick="toggleAggSource(\'' + src + '\')">' + escHtml(label) + '</button>';
+  }).join('');
+}
+function toggleAggSource(src) {
+  var i = aggSelectedSources.indexOf(src);
+  if (i >= 0) aggSelectedSources.splice(i, 1); else aggSelectedSources.push(src);
+  renderAggSourceBar();
+  var q = $input ? $input.value.trim() : '';
+  if (q) doSearch(q);
+}
+// 并行分源搜索：快的源先出结果，不等最慢的（含海外源时尤其有用）
+function doAggSearchProgressive(q, seq) {
+  playlist = [];
+  var seen = {};
+  $results.innerHTML = '<div class="search-empty">搜索中…</div>';
+  $results.classList.add('show');
+  var srcs = aggSelectedSources.length ? aggSelectedSources.slice() : AGG_ALL_SOURCES.slice();
+  var pending = srcs.length;
+  rememberSearchQuery(q);
+  srcs.forEach(function(src){
+    apiJson('/api/agg/search?keywords=' + encodeURIComponent(q) + '&limit=8&sources=' + encodeURIComponent(src), { timeoutMs: 12000 })
+      .then(function(res){
+        if (seq !== searchRequestSeq || ($input && $input.value.trim() !== q)) return;
+        var added = false;
+        ((res && res.songs) || []).forEach(function(s){
+          var k = (s.source || '') + ':' + (s.id || '');
+          if (seen[k] || !s.name) return;
+          seen[k] = true; playlist.push(s); added = true;
+        });
+        if (added) {
+          searchLastResultQuery = searchResultKey(q, 'agg');
+          renderSongSearchResults(playlist, { incremental: true });
+        }
+      })
+      .catch(function(e){ console.warn('[aggSearch]', src, e && e.message); })
+      .finally(function(){
+        pending--;
+        if (pending === 0 && seq === searchRequestSeq && !playlist.length) {
+          $results.innerHTML = '<div class="search-empty">没有找到相关歌曲</div>';
+          $results.classList.add('show');
+        }
+      });
+  });
 }
 function searchResultMetaText(song) {
   var bits = [];
@@ -17646,6 +17744,17 @@ function mergeSongSearchResults(neteaseSongs, qqSongs, limit, q) {
   return out.slice(0, limit);
 }
 async function fetchMusicSearchResults(q, mode) {
+  if (mode === 'agg') {
+    var aggRes = await apiJson('/api/agg/search?keywords=' + encodeURIComponent(q) + '&limit=30');
+    var aggSongs = (aggRes && aggRes.songs) || [];
+    var seen = {}, out = [];
+    aggSongs.forEach(function(s){
+      var k = (s.source || '') + ':' + (s.id || '');
+      if (seen[k] || !s.name) return;
+      seen[k] = true; out.push(s);
+    });
+    return out;
+  }
   if (mode === 'qq') {
     var qqOnly = await apiJson('/api/qq/search?keywords=' + encodeURIComponent(q) + '&limit=12');
     return mergeSongSearchResults([], qqOnly.songs || [], 18, q);
@@ -17663,7 +17772,8 @@ async function fetchMusicSearchResults(q, mode) {
   if (result[1].status === 'rejected') console.warn('QQ search failed:', result[1].reason);
   return mergeSongSearchResults(neteaseSongs, qqSongs, 18, q);
 }
-function renderSongSearchResults(songs) {
+function renderSongSearchResults(songs, opts) {
+  opts = opts || {};
   playlist = songs || [];
   $results.innerHTML = playlist.map(function(s, i){
     var vipTag = (s.fee === 1) ? '<span class="tag-vip">VIP</span>' : '';
@@ -17688,7 +17798,7 @@ function renderSongSearchResults(songs) {
   }).join('');
   $results.classList.add('show');
   syncLikeStatusForSongs(playlist);
-  if (window.gsap) animateListItems($results, '.search-result', { x: 0, y: 6, stagger: 0.012, duration: 0.18, limit: 18 });
+  if (!opts.incremental && window.gsap) animateListItems($results, '.search-result', { x: 0, y: 6, stagger: 0.012, duration: 0.18, limit: 18 });
 }
 
 async function doSearch(q, opts) {
@@ -17704,6 +17814,7 @@ async function doSearch(q, opts) {
     return;
   }
   var requestSeq = ++searchRequestSeq;
+  if (searchMode === 'agg') { doAggSearchProgressive(q, requestSeq); return; }
   try {
     var mode = searchMode;
     var songs = await fetchMusicSearchResults(q, mode);
@@ -18468,7 +18579,9 @@ async function playQueueAt(idx, opts) {
       requestedQuality = qqPlaybackQualityCeiling;
     }
     var qualityParam = '&quality=' + encodeURIComponent(requestedQuality);
-    var data = isQQPlayback
+    var data = songProviderKey(song) === 'agg'
+      ? await apiJson('/api/agg/song/url?' + aggSongQuery(song) + qualityParam)
+      : isQQPlayback
       ? await apiJson('/api/qq/song/url?mid=' + encodeURIComponent(song.mid || song.songmid || song.id || '') + '&mediaMid=' + encodeURIComponent(song.mediaMid || song.media_mid || '') + qualityParam)
       : await apiJson('/api/song/url?id=' + song.id + qualityParam);
     if (token !== trackSwitchToken) return;
@@ -19019,7 +19132,9 @@ async function fetchLyric(songOrId, token) {
     var song = (songOrId && typeof songOrId === 'object') ? songOrId : null;
     var provider = songProviderKey(song);
     var endpoint;
-    if (provider === 'qq') {
+    if (provider === 'agg') {
+      endpoint = '/api/agg/lyric?' + aggSongQuery(song);
+    } else if (provider === 'qq') {
       var mid = song.mid || song.songmid || song.id || '';
       var qqId = song.qqId || (/^\d+$/.test(String(song.id || '')) ? song.id : '');
       endpoint = '/api/qq/lyric?mid=' + encodeURIComponent(mid) + '&id=' + encodeURIComponent(qqId);

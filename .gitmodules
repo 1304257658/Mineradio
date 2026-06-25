@@ -1,0 +1,3 @@
+[submodule "go-music-api"]
+	path = go-music-api
+	url = https://github.com/guohuiyuan/go-music-api
